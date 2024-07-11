@@ -75,6 +75,7 @@
         Your browser does not support the video tag.
     </video>
     <script type="module">
+
         let glyphWidth = 8;
         let glyphHeight = 8 * 1.25;
         const glyphsAcrossTexture = 15;
@@ -198,7 +199,6 @@ fn frag_main(fsInput: Vertex) -> @location(0) vec4<f32> {
     let charX = charIndex % uni.glyphsAcrossTexture;
     var charY = charIndex / uni.glyphsAcrossTexture;
 
-
     let glyphTexCoordX = f32(charX) / f32(uni.glyphsAcrossTexture) + (texCoordX % uni.glyphSize.x) / uni.glyphSize.x / f32(uni.glyphsAcrossTexture);
     let glyphTexCoordY = f32(charY) / f32(uni.glyphsDownTexture) + (texCoordY % uni.glyphSize.y) / uni.glyphSize.y / f32(uni.glyphsDownTexture);
 
@@ -238,7 +238,7 @@ fn frag_main(fsInput: Vertex) -> @location(0) vec4<f32> {
             let imageTexture = device.createTexture({
                 size: [256, 256, 1],
                 format: "rgba8unorm",
-                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
             });
 
             const uniformBuffer = device.createBuffer({
@@ -302,7 +302,7 @@ fn frag_main(fsInput: Vertex) -> @location(0) vec4<f32> {
                 imageTexture = device.createTexture({
                     size: [width, height, 1],
                     format: "rgba8unorm",
-                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
                 });
 
                 bindGroup = device.createBindGroup({
@@ -316,53 +316,68 @@ fn frag_main(fsInput: Vertex) -> @location(0) vec4<f32> {
                 });
             }
 
-            const wscript = `
-                const canvas = new OffscreenCanvas(300,300);
-                const ctx = canvas.getContext('2d',{willReadFrequently:true});
-                self.onmessage = function(event) {
-                    const { videoFrame } = event.data;
+            // //this is bottlenecky, we don't have a fast way to convert a video srcObject to a non planar image
+            // const wscript = `
+            //     const canvas = new OffscreenCanvas(300,300);
+            //     const ctx = canvas.getContext('2d',{willReadFrequently:true});
+            //     self.onmessage = function(event) {
+            //         const { videoFrame } = event.data;
 
-                    canvas.width = videoFrame.displayWidth; 
-                    canvas.height = videoFrame.displayHeight;
-                    ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
-                    videoFrame.close();
-                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            //         canvas.width = videoFrame.displayWidth; 
+            //         canvas.height = videoFrame.displayHeight;
+            //         ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
+            //         videoFrame.close();
+            //         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
             
-                    // Send processed imageData back to main thread
-                    self.postMessage({ imageData:imageData.data, width:canvas.width, height:canvas.height }, [imageData.data.buffer]);
-                };
-            `;
+            //         // Send processed imageData back to main thread
+            //         self.postMessage({ imageData:imageData.data, width:canvas.width, height:canvas.height }, [imageData.data.buffer]);
+            //     };
+            // `;
             
-            const blob = new Blob([wscript], { type: 'application/javascript' });
-            const worker = new Worker(URL.createObjectURL(blob));
+            // const blob = new Blob([wscript], { type: 'application/javascript' });
+            // const worker = new Worker(URL.createObjectURL(blob));
 
-            worker.onmessage = (ev) => {
-                const {imageData, width, height} = ev.data;
-                const image = new ImageData(imageData,width,height);
-                if (imageTexture.width !== image.width || imageTexture.height !== image.height) {
-                    resizeTexture(image.width, image.height);
+            // worker.onmessage = (ev) => {
+            //     const {imageData, width, height} = ev.data;
+            //     const image = new ImageData(imageData,width,height);
+            //     if (imageTexture.width !== image.width || imageTexture.height !== image.height) {
+            //         resizeTexture(image.width, image.height);
 
-                    canvas.width = image.width; canvas.height = image.height;
-                }
+            //         canvas.width = image.width; canvas.height = image.height;
+            //     }
 
-                device.queue.writeTexture(
-                    { texture: imageTexture },
-                    image.data.buffer,
-                    { bytesPerRow: image.width * 4 },
-                    [image.width, image.height, 1]
-                );
+            //     device.queue.writeTexture(
+            //         { texture: imageTexture },
+            //         image.data.buffer,
+            //         { bytesPerRow: image.width * 4 },
+            //         [image.width, image.height, 1]
+            //     );
 
-                //console.timeEnd('wrk');
-                videoElement.requestVideoFrameCallback(updateVideoFrame);
-            }
+            //     //console.timeEnd('wrk');
+            //     videoElement.requestVideoFrameCallback(updateVideoFrame);
+            // }
 
-
-            function updateVideoFrame() {
+            function updateVideoFrame(now, metadata) {
                 if (videoElement.videoWidth && !videoElement.paused && !videoElement.ended) {
                     const frame = new VideoFrame(videoElement);
-                    //console.time('wrk');
-                    worker.postMessage({videoFrame:frame},[frame]);
-                }  
+
+                    //worker.postMessage({videoFrame:frame},[frame]);
+
+                    if (imageTexture.width !== frame.displayWidth || imageTexture.height !== frame.displayHeight) {
+                        resizeTexture(frame.displayWidth, frame.displayHeight);
+                        canvas.width = frame.displayWidth; canvas.height = frame.displayHeight;
+                    }
+
+                    device.queue.copyExternalImageToTexture(
+                        { source: frame },
+                        { texture: imageTexture },
+                        [frame.displayWidth, frame.displayHeight]
+                    );
+
+                    frame.close();
+                }
+
+                videoElement.requestVideoFrameCallback(updateVideoFrame);
             }
 
             const canvasTemp = new OffscreenCanvas(videoElement.videoWidth, videoElement.videoHeight);
