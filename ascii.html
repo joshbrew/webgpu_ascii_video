@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>WebGPU ASCII Shader</title>
+    <style>
+         body {
+            background-color: black;
+            font-family: Arial, sans-serif;
+            color: white;
+            text-align: center;
+        }
+        #gpuCanvas, #videoElement {
+            width: 100%;
+            height: auto;
+            display: none;
+        }
+        .controls {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .controls label, .controls input, .controls button {
+            margin: 0 10px;
+        }
+        .video-input {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .video-input input {
+            padding: 5px;
+            margin: 0 10px;
+        }
+        .toggle-buttons {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .toggle-buttons button {
+            margin: 0 10px;
+            padding: 10px;
+            background-color: #444;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        .toggle-buttons button.active {
+            background-color: #888;
+        }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <label>
+            Color:
+            <input type="checkbox" id="colorToggle" checked>
+        </label>
+        <label>
+            Grid Size:
+            <input type="number" id="gridSize" value="8" min="8" max="64">
+        </label>
+        <button id="showCanvas" class="active">Show Canvas</button>
+        <button id="showVideo">Show Video</button>
+    </div>
+    <div class="video-input">
+        <input type="url" id="videoUrlInput" placeholder="Enter video URL">
+        <input type="file" id="videoFileInput" accept="video/*">
+    </div>
+    <canvas id="gpuCanvas"></canvas>
+    <video id="videoElement" controls loop muted crossorigin="anonymous">
+        <source src="http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4" type="video/mp4">
+        Your browser does not support the video tag.
+    </video>
+    <script type="module">
+        // WebGPU and shader code remains the same...
+
+        let glyphWidth = 8;
+        let glyphHeight = 8 * 1.25;
+        const glyphsAcrossTexture = 15;
+        const glyphsDownTexture = 6; //trying to not leave blank glyphs in the grid
+        let useColor = true;
+
+        function generateGlyphTextureAtlas() {
+            const ctx = document.createElement('canvas').getContext('2d');
+            const fontSizePx = 12;
+            ctx.canvas.width = fontSizePx * glyphsAcrossTexture;
+            ctx.canvas.height = fontSizePx*1.25 * glyphsDownTexture;
+
+            let x = 0;
+            let y = 0;
+
+            // Apply filter(s) to text
+            //ctx.filter = 'blur(1px)';
+
+            ctx.font = `${fontSizePx*1.25}px monospace`;
+            ctx.textBaseline = 'middle';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'white';
+            for (let c = 33; c < 123; ++c) {
+                ctx.fillText(String.fromCodePoint(c), x + fontSizePx / 2, y + fontSizePx*1.25 / 2);
+                x += fontSizePx;
+                if (x >= ctx.canvas.width) {
+                    x = 0;
+                    y += fontSizePx*1.25;
+                }
+            }
+
+
+            return ctx.canvas;
+        }
+
+        async function init() {
+            if (!navigator.gpu) {
+                console.error("WebGPU not supported");
+                return;
+            }
+
+            const canvas = document.getElementById("gpuCanvas");
+            const adapter = await navigator.gpu.requestAdapter();
+            const device = await adapter.requestDevice();
+
+            const context = canvas.getContext('webgpu');
+            const swapChainFormat = "bgra8unorm";
+            context.configure({
+                device: device,
+                format: swapChainFormat,
+                alphaMode: "opaque"
+            });
+
+            const glyphCanvas = generateGlyphTextureAtlas();
+            glyphCanvas.style.width = '50%';
+            document.body.appendChild(glyphCanvas); // For debugging purposes
+
+            const glyphTexture = device.createTexture({
+                size: [glyphCanvas.width, glyphCanvas.height, 1],
+                format: "rgba8unorm",
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+
+            device.queue.copyExternalImageToTexture(
+                { source: glyphCanvas },
+                { texture: glyphTexture },
+                [glyphCanvas.width, glyphCanvas.height, 1]
+            );
+
+            const asciiShaderCode = `
+@group(0) @binding(0) var<uniform> uni: Uniforms;
+@group(0) @binding(1) var ourSampler: sampler;
+@group(0) @binding(2) var ourTexture: texture_2d<f32>;
+@group(0) @binding(3) var glyphTexture: texture_2d<f32>;
+
+struct Vertex {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texcoord: vec2<f32>,
+};
+
+struct Uniforms {
+    scale: vec2<f32>,
+    canvasSize: vec2<f32>,
+    glyphSize: vec2<f32>,
+    glyphsAcrossTexture: u32,
+    glyphsDownTexture: u32,
+    useColor: u32,
+};
+
+@vertex
+fn vtx_main(@builtin(vertex_index) vertexIndex: u32) -> Vertex {
+    var pos = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
+        vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
+    );
+
+    var output: Vertex;
+    let xy = pos[vertexIndex];
+    output.position = vec4<f32>(xy * uni.scale, 0.0, 1.0);
+    output.texcoord = vec2<f32>((xy.x + 1.0) / 2.0, 1.0 - (xy.y + 1.0) / 2.0); // Flip Y coordinate
+    return output;
+}
+
+@fragment
+fn frag_main(fsInput: Vertex) -> @location(0) vec4<f32> {
+    let texCoordX = fsInput.texcoord.x * uni.canvasSize.x;
+    let texCoordY = fsInput.texcoord.y * uni.canvasSize.y;
+
+    let tileX = u32(texCoordX / uni.glyphSize.x);
+    let tileY = u32(texCoordY / uni.glyphSize.y);
+
+    let sourcePixelX = tileX * u32(uni.glyphSize.x) + u32(uni.glyphSize.x) / 2;
+    let sourcePixelY = tileY * u32(uni.glyphSize.y) + u32(uni.glyphSize.y) / 2;
+
+    let sourceTexCoord = vec2<f32>(f32(sourcePixelX) / uni.canvasSize.x, f32(sourcePixelY) / uni.canvasSize.y);
+    let color = textureSample(ourTexture, ourSampler, sourceTexCoord);
+
+    var value = (color.r + color.g + color.b) / 3.0;
+
+    let charIndex = u32(value * f32(uni.glyphsAcrossTexture * uni.glyphsDownTexture)) - 1;
+    let charX = charIndex % uni.glyphsAcrossTexture;
+    var charY = charIndex / uni.glyphsAcrossTexture;
+
+
+    let glyphTexCoordX = f32(charX) / f32(uni.glyphsAcrossTexture) + (texCoordX % uni.glyphSize.x) / uni.glyphSize.x / f32(uni.glyphsAcrossTexture);
+    let glyphTexCoordY = f32(charY) / f32(uni.glyphsDownTexture) + (texCoordY % uni.glyphSize.y) / uni.glyphSize.y / f32(uni.glyphsDownTexture);
+
+    let glyphColor = textureSample(glyphTexture, ourSampler, vec2<f32>(glyphTexCoordX, glyphTexCoordY));
+
+    if (uni.useColor == 1u) {
+        return glyphColor * color;
+    } else {
+        return glyphColor * vec4<f32>(1.0);
+    }
+}
+`;
+
+            const module = device.createShaderModule({ code: asciiShaderCode });
+
+            const pipeline = device.createRenderPipeline({
+                layout: 'auto',
+                vertex: {
+                    module: module,
+                    entryPoint: "vtx_main"
+                },
+                fragment: {
+                    module: module,
+                    entryPoint: "frag_main",
+                    targets: [
+                        {
+                            format: swapChainFormat
+                        }
+                    ]
+                },
+                primitive: {
+                    topology: "triangle-list"
+                }
+            });
+
+            let imageBuffer = new Uint8Array(256 * 256 * 4).fill(255);
+            let imageTexture = device.createTexture({
+                size: [256, 256, 1],
+                format: "rgba8unorm",
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+            });
+
+            const uniformBuffer = device.createBuffer({
+                label: 'uniformscale',
+                size: 52, // Updated size
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+
+            const bindGroupLayout = pipeline.getBindGroupLayout(0);
+            let bindGroup = device.createBindGroup({
+                layout: bindGroupLayout,
+                entries: [
+                    { binding: 0, resource: { buffer: uniformBuffer } },
+                    { binding: 1, resource: device.createSampler({}) },
+                    { binding: 2, resource: imageTexture.createView() },
+                    { binding: 3, resource: glyphTexture.createView() },
+                ]
+            });
+
+            const videoElement = document.getElementById('videoElement');
+            videoElement.play();
+
+            setTimeout(() =>{ 
+                videoElement.muted = false;}, 1000)
+
+            const wgslTypeSizes32 = {
+                'u32': { type: 'u32', alignment: 4, size: 4, ct: 1 },
+                'vec3<u32>': { type: 'vec3<u32>', alignment: 16, size: 12, ct: 3 },
+                'f32': { type: 'f32', alignment: 4, size: 4, ct: 1 },
+                'vec2<f32>': { type: 'vec2<f32>', alignment: 8, size: 8, ct: 2 }
+            };
+
+            const setUBOposition = (dataView, typeInfo, offset, input) => {
+                offset = Math.ceil(offset / typeInfo.alignment) * typeInfo.alignment;
+                if (input !== undefined) {
+                    if (typeInfo.type.startsWith('vec')) {
+                        const vecSize = typeInfo.size / 4;
+                        for (let j = 0; j < vecSize; j++) {
+                            if (typeInfo.type?.includes('f')) dataView.setFloat32(offset + j * 4, input[j], true);
+                            else dataView.setInt32(offset + j * 4, input[j], true);
+                        }
+                    } else {
+                        switch (typeInfo.type) {
+                            case 'f32':
+                                dataView.setFloat32(offset, input, true);
+                                break;
+                            case 'i32':
+                                dataView.setInt32(offset, input, true);
+                                break;
+                            case 'u32':
+                                dataView.setUint32(offset, input, true);
+                                break;
+                        }
+                    }
+                }
+                offset += typeInfo.size;
+                return offset;
+            };
+
+            function resizeTexture(width, height) {
+                imageTexture = device.createTexture({
+                    size: [width, height, 1],
+                    format: "rgba8unorm",
+                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+                });
+
+                bindGroup = device.createBindGroup({
+                    layout: bindGroupLayout,
+                    entries: [
+                        { binding: 0, resource: { buffer: uniformBuffer } },
+                        { binding: 1, resource: device.createSampler({}) },
+                        { binding: 2, resource: imageTexture.createView() },
+                        { binding: 3, resource: glyphTexture.createView() },
+                    ]
+                });
+            }
+
+            const wscript = `
+                const canvas = new OffscreenCanvas(300,300);
+                const ctx = canvas.getContext('2d',{willReadFrequently:true});
+                self.onmessage = function(event) {
+                    const { videoFrame } = event.data;
+
+                    canvas.width = videoFrame.displayWidth; 
+                    canvas.height = videoFrame.displayHeight;
+                    ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
+                    videoFrame.close();
+                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            
+                    // Send processed imageData back to main thread
+                    self.postMessage({ imageData:imageData.data, width:canvas.width, height:canvas.height }, [imageData.data.buffer]);
+                };
+            `;
+            
+            const blob = new Blob([wscript], { type: 'application/javascript' });
+            const worker = new Worker(URL.createObjectURL(blob));
+
+            worker.onmessage = (ev) => {
+                const {imageData, width, height} = ev.data;
+                const image = new ImageData(imageData,width,height);
+                if (imageTexture.width !== image.width || imageTexture.height !== image.height) {
+                    resizeTexture(image.width, image.height);
+
+                    canvas.width = image.width; canvas.height = image.height;
+                }
+
+                device.queue.writeTexture(
+                    { texture: imageTexture },
+                    image.data.buffer,
+                    { bytesPerRow: image.width * 4 },
+                    [image.width, image.height, 1]
+                );
+
+                //console.timeEnd('wrk');
+                videoElement.requestVideoFrameCallback(updateVideoFrame);
+            }
+
+
+            function updateVideoFrame() {
+                if (videoElement.videoWidth && !videoElement.paused && !videoElement.ended) {
+                    const frame = new VideoFrame(videoElement);
+                    //console.time('wrk');
+                    worker.postMessage({videoFrame:frame},[frame]);
+                }  
+            }
+
+            const canvasTemp = new OffscreenCanvas(videoElement.videoWidth, videoElement.videoHeight);
+            const tempCtx = canvasTemp.getContext('2d', {willReadFrequently:true})
+            
+            videoElement.requestVideoFrameCallback(() => {
+                updateVideoFrame();
+            });
+
+            function updateShaderUniforms() {
+                const canvasAspect = canvas.width / canvas.height;
+                const videoAspect = videoElement.videoWidth / videoElement.videoHeight;
+                let scaleX = 1.0;
+                let scaleY = 1.0;
+                if (canvasAspect > videoAspect) {
+                    scaleX = videoAspect / canvasAspect;
+                } else {
+                    scaleY = canvasAspect / videoAspect;
+                }
+
+                const buffer = new ArrayBuffer(52); // Updated size
+                const dataView = new DataView(buffer);
+                let offset = 0;
+
+                offset = setUBOposition(dataView, wgslTypeSizes32['vec2<f32>'], offset, [scaleX, scaleY]);
+                offset = setUBOposition(dataView, wgslTypeSizes32['vec2<f32>'], offset, [canvas.width, canvas.height]);
+                offset = setUBOposition(dataView, wgslTypeSizes32['vec2<f32>'], offset, [glyphWidth, glyphHeight]);
+                offset = setUBOposition(dataView, wgslTypeSizes32['u32'], offset, glyphsAcrossTexture);
+                offset = setUBOposition(dataView, wgslTypeSizes32['u32'], offset, glyphsDownTexture);
+                offset = setUBOposition(dataView, wgslTypeSizes32['u32'], offset, useColor ? 1 : 0);
+
+                device.queue.writeBuffer(uniformBuffer, 0, buffer);
+            }
+
+            function frame() {
+                updateShaderUniforms();
+
+                const commandEncoder = device.createCommandEncoder();
+                const textureView = context.getCurrentTexture().createView();
+                const renderPassDescriptor = {
+                    colorAttachments: [
+                        {
+                            view: textureView,
+                            loadOp: 'clear',
+                            storeOp: 'store',
+                            clearValue: { r: 0, g: 0, b: 0, a: 1 }
+                        }
+                    ]
+                };
+
+                const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+                passEncoder.setPipeline(pipeline);
+                passEncoder.setBindGroup(0, bindGroup);
+                passEncoder.draw(6);
+                passEncoder.end();
+
+                device.queue.submit([commandEncoder.finish()]);
+                requestAnimationFrame(frame);
+            }
+
+            
+            document.getElementById('colorToggle').addEventListener('change', (event) => {
+                useColor = event.target.checked;
+                updateShaderUniforms();
+            });
+
+            document.getElementById('gridSize').addEventListener('input', (event) => {
+                const size = parseInt(event.target.value, 10);
+                glyphWidth = size;
+                glyphHeight = size * 1.25; // Adjust height proportionally
+                updateShaderUniforms();
+            });
+
+            frame();
+        }
+
+        init();
+
+        // Toggle between canvas and video
+        const showCanvasButton = document.getElementById('showCanvas');
+        const showVideoButton = document.getElementById('showVideo');
+        const gpuCanvas = document.getElementById('gpuCanvas');
+
+        showCanvasButton.addEventListener('click', () => {
+            gpuCanvas.style.display = 'block';
+            videoElement.style.display = 'none';
+            showCanvasButton.classList.add('active');
+            showVideoButton.classList.remove('active');
+        });
+
+        showVideoButton.addEventListener('click', () => {
+            gpuCanvas.style.display = 'none';
+            videoElement.style.display = 'block';
+            showCanvasButton.classList.remove('active');
+            showVideoButton.classList.add('active');
+        });
+
+        // Handle video URL input
+        const videoUrlInput = document.getElementById('videoUrlInput');
+        videoUrlInput.addEventListener('change', () => {
+            const url = videoUrlInput.value;
+            if (url) {
+                videoElement.src = url;
+                videoElement.play();
+            }
+        });
+
+        // Handle video file input
+        const videoFileInput = document.getElementById('videoFileInput');
+        videoFileInput.addEventListener('change', () => {
+            const file = videoFileInput.files[0];
+            if (file) {
+                const url = URL.createObjectURL(file);
+                videoElement.src = url;
+                videoElement.play();
+            }
+        });
+
+        // Initialize with canvas visible
+        gpuCanvas.style.display = 'block';
+        videoElement.style.display = 'none';
+    </script>
+</body>
+</html>
